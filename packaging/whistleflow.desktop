@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Whistleflow
+Comment=Local push-to-talk dictation
+Exec=whistleflow
+Terminal=false
+X-GNOME-Autostart-enabled=true
+OnlyShowIn=KDE;

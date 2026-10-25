@@ -1,0 +1,85 @@
+[project]
+name = "whistle-cli"
+version = "0.1.0"
+description = "Local push-to-talk dictation for X11, powered by the Cactus Whistle model"
+readme = "README.md"
+authors = [
+    { name = "whistleflow contributors" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "cactus-needle[mic]>=3.2.8",
+    "numpy>=2.5.4",
+    "pynput>=1.8.2",
+    "rich>=15.0.0",
+    "sounddevice>=0.5.6",
+    "soundfile>=0.14.0",
+    "soxr>=1.1.0",
+]
+
+[project.scripts]
+whistleflow = "whistleflow.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/iamMD01/whistleflow"
+Repository = "https://github.com/iamMD01/whistleflow"
+Issues = "https://github.com/iamMD01/whistleflow/issues"
+
+[build-system]
+requires = ["uv_build>=0.13.5,<0.14.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+# Two root modules ship in this distribution: the original whistle-cli stub and
+# the whistleflow daemon.
+module-name = "whistleflow"
+
+[dependency-groups]
+dev = [
+    "mypy>=2.4.0",
+    "pytest>=9.1.1",
+    "ruff>=0.17.2",
+]
+
+[tool.ruff]
+line-length = 100
+src = ["src"]
+# product.md is the specification, not source: leave its code blocks alone.
+extend-exclude = ["product.md", "TODO.md"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "BLE", "S", "RUF"]
+# B008/BLE001 are handled case by case; every broad except in the daemon is
+# deliberate and carries a comment explaining why.
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+# This daemon exists to shell out to xclip, xdotool, paplay and notify-send.
+# Every call uses a fixed argv list that no user input reaches, so the bandit
+# rules about untrusted input do not apply here.
+"src/whistleflow/*.py" = ["S603", "S607"]
+# In a pytest suite the assertions are the test.
+"tests/*.py" = ["S101"]
+
+[tool.mypy]
+python_version = "3.12"
+warn_unused_ignores = true
+warn_redundant_casts = true
+no_implicit_optional = true
+show_error_codes = true
+
+# These ship no type information; ignoring the missing stubs is cleaner than
+# scattering `# type: ignore` through the source.
+[[tool.mypy.overrides]]
+module = [
+    "cactus_needle.*",
+    "needle.*",
+    "pynput.*",
+    "sounddevice.*",
+    "soundfile.*",
+    "soxr.*",
+]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

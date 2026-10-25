@@ -1,0 +1,15 @@
+[Unit]
+Description=Whistleflow — local push-to-talk dictation
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+# Must be a path without spaces: systemd splits ExecStart on whitespace.
+ExecStart=%h/.local/bin/whistleflow
+Restart=on-failure
+RestartSec=3
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target

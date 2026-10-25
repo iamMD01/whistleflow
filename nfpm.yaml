@@ -1,0 +1,41 @@
+# Build a .deb with nfpm:  npx --yes nfpm package --packager deb --config nfpm.yaml
+#
+# The model weights are deliberately not bundled: they are downloaded once
+# into ~/.cache/cactus-needle/ and their licence has to be checked before they
+# are redistributed.
+name: whistleflow
+version: 0.1.0
+arch: amd64
+platform: linux
+section: utils
+priority: optional
+maintainer: whistleflow contributors
+description: |
+  Local push-to-talk dictation for X11. Hold Ctrl+Shift+L, speak, release,
+  and the transcript is pasted at the cursor of the focused window.
+  Inference runs locally with the Cactus Whistle speech-to-text model.
+homepage: https://github.com/iamMD01/whistleflow.git
+license: MIT
+
+depends:
+  - xclip
+  - xdotool
+  - xprop
+  - paplay
+  - libnotify-bin
+  - python3
+
+contents:
+  # A relocatable tree with the wheel installed into it.
+  - src: ./dist/venv
+    dst: /opt/whistleflow
+    file_info:
+      mode: 0755
+  - src: ./packaging/whistleflow.desktop
+    dst: /usr/share/applications/whistleflow.desktop
+    file_info:
+      mode: 0644
+
+scripts:
+  postinstall: ./packaging/postinstall.sh
+  postremove: ./packaging/postremove.sh

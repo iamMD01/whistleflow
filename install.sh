@@ -1,0 +1,317 @@
+#!/bin/sh
+# whistleflow installer.
+#
+#   curl -fsSL https://raw.githubusercontent.com/iamMD01/whistleflow/main/install.sh | sh
+#
+# Installs the system packages, the Python environment, the speech-to-text
+# model, the systemd user service and the configuration, then verifies the
+# whole thing with `whistleflow --check`.
+#
+# Options:
+#   --keys "ctrl+shift+l"   the chord that triggers a recording
+#   --repo <url>            install from a different repository
+#   --no-start              install everything but do not start the daemon
+#   --help                  show this text
+
+set -eu
+
+REPO_URL="https://github.com/iamMD01/whistleflow.git"
+SRC_DIR="${WHISTLEFLOW_SRC:-$HOME/.local/src/whistleflow}"
+BIN_DIR="$HOME/.local/bin"
+CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
+CONFIG_DIR="$CONFIG_HOME/whistleflow"
+STATE_DIR="$STATE_HOME/whistleflow"
+UNIT_DIR="$HOME/.config/systemd/user"
+SERVICE_NAME="whistleflow"
+
+KEYS="ctrl+shift+l"
+DO_START=1
+
+# ---------------------------------------------------------------- output helpers
+
+say()  { printf '\n\033[1;36m==>\033[0m %s\n' "$*"; }
+info() { printf '    %s\n' "$*"; }
+ok()   { printf '\033[1;32m  ok\033[0m  %s\n' "$*"; }
+warn() { printf '\033[1;33m  !\033[0m  %s\n' "$*" >&2; }
+die()  { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
+
+usage() {
+    sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'
+    exit 0
+}
+
+# ------------------------------------------------------------------- arguments
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --keys)    KEYS="${2:?--keys needs a value}"; shift 2 ;;
+        --keys=*)  KEYS="${1#*=}"; shift ;;
+        --repo)    REPO_URL="${2:?--repo needs a value}"; shift 2 ;;
+        --repo=*)  REPO_URL="${1#*=}"; shift ;;
+        --no-start) DO_START=0; shift ;;
+        --help|-h) usage ;;
+        *)         die "unknown option: $1 (try --help)" ;;
+    esac
+done
+
+case "$REPO_URL" in
+    *PLACEHOLDER*) REPO_PLACEHOLDER=1 ;;
+    *)              REPO_PLACEHOLDER=0 ;;
+esac
+
+# ------------------------------------------------------------------ preflight
+
+say "Checking the system"
+
+if [ "$(uname -s)" != "Linux" ]; then
+    die "whistleflow only runs on Linux."
+fi
+
+if [ "${XDG_SESSION_TYPE:-}" != "x11" ]; then
+    warn "your session is '${XDG_SESSION_TYPE:-unknown}', not x11."
+    warn "whistleflow captures global key presses, which Wayland does not allow."
+    warn "Log in with the X11 session (Plasma: 'Plasma (X11)') and run this again."
+    exit 1
+fi
+ok "X11 session"
+
+if [ ! -e /etc/os-release ] || ! grep -qi 'ubuntu\|debian' /etc/os-release; then
+    warn "this looks like a non-Debian system; the package step may not work."
+fi
+
+command -v apt-get >/dev/null 2>&1 || die "apt-get not found; install the packages by hand: xclip xdotool x11-utils pulseaudio-utils libnotify-bin libportaudio2"
+
+if [ -n "${SUDO_USER:-}" ] || [ "$(id -u)" -eq 0 ]; then
+    SUDO=""
+else
+    command -v sudo >/dev/null 2>&1 || die "sudo not found; install the system packages by hand."
+    SUDO="sudo"
+fi
+ok "package manager ready"
+
+# ------------------------------------------------------------- system packages
+
+say "Installing the system packages"
+
+PACKAGES="xclip xdotool x11-utils pulseaudio-utils libnotify-bin libportaudio2"
+MISSING=""
+for package in $PACKAGES; do
+    if ! dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -q "ok installed"; then
+        MISSING="$MISSING $package"
+    fi
+done
+
+if [ -n "$MISSING" ]; then
+    info "need:$MISSING"
+    $SUDO apt-get update -qq
+    # shellcheck disable=SC2086
+    $SUDO apt-get install -y --no-install-recommends $MISSING
+    ok "installed:$MISSING"
+else
+    ok "all present"
+fi
+
+# ------------------------------------------------------------------------ uv
+
+say "Setting up the Python environment"
+
+if ! command -v uv >/dev/null 2>&1; then
+    info "installing uv"
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+    PATH="$HOME/.local/bin:$PATH"
+    export PATH
+fi
+ok "uv $(uv --version 2>/dev/null | awk '{print $2}')"
+
+# --------------------------------------------------------------------- source
+
+say "Fetching the source"
+
+if [ "$REPO_PLACEHOLDER" -eq 1 ]; then
+    die "this installer still points at the placeholder repository.
+    Edit the REPO_URL line at the top of install.sh to your own GitHub URL."
+fi
+
+if [ -d "$SRC_DIR/.git" ]; then
+    info "updating $SRC_DIR"
+    git -C "$SRC_DIR" pull --ff-only --quiet
+else
+    mkdir -p "$(dirname "$SRC_DIR")"
+    git clone --quiet --depth 1 "$REPO_URL" "$SRC_DIR"
+fi
+ok "source in $SRC_DIR"
+
+info "installing the Python dependencies"
+( cd "$SRC_DIR" && uv sync --frozen --quiet )
+VENV="$SRC_DIR/.venv"
+[ -x "$VENV/bin/python" ] || die "the virtual environment was not created."
+ok "environment ready"
+
+# -------------------------------------------------------------------- wrapper
+
+say "Installing the command"
+
+mkdir -p "$BIN_DIR"
+cat > "$BIN_DIR/$SERVICE_NAME" <<EOF
+#!/bin/sh
+# Generated by the whistleflow installer.
+exec "$VENV/bin/python" -m $SERVICE_NAME "\$@"
+EOF
+chmod +x "$BIN_DIR/$SERVICE_NAME"
+ok "$BIN_DIR/$SERVICE_NAME"
+
+# --------------------------------------------------------------------- model
+
+say "Caching the speech-to-text model"
+
+# The daemon runs with HF_HUB_OFFLINE=1, so it can never download the model
+# itself. It has to be on disk before the daemon is ever started.
+if ls "$HOME"/.cache/cactus-needle/whistle/*/whistle.cact >/dev/null 2>&1; then
+    ok "already cached"
+else
+    info "downloading ~18 MB, this happens once"
+    NEEDLE_TELEMETRY=0 "$VENV/bin/python" -c 'import needle; needle.Whistle()' \
+        || die "the model could not be downloaded. Check your network and retry."
+    ok "cached"
+fi
+
+# -------------------------------------------------------------------- config
+
+say "Writing the configuration"
+
+mkdir -p "$CONFIG_DIR"
+
+if [ -f "$CONFIG_DIR/config.toml" ]; then
+    ok "keeping your existing config"
+else
+    # A guard modifier blocks the chord it belongs to, so every modifier that
+    # appears in the chord has to have its guard switched off.
+    case "$KEYS" in
+        *ctrl*)  IGNORE_CTRL="false" ;;
+        *)       IGNORE_CTRL="true" ;;
+    esac
+    case "$KEYS" in
+        *shift*) IGNORE_SHIFT="false" ;;
+        *)       IGNORE_SHIFT="true" ;;
+    esac
+    case "$KEYS" in
+        *super*) IGNORE_SUPER="false" ;;
+        *)       IGNORE_SUPER="true" ;;
+    esac
+
+    cat > "$CONFIG_DIR/config.toml" <<EOF
+# Written by the whistleflow installer.
+
+[trigger]
+keys = "$KEYS"
+min_duration_ms = 300
+max_duration_s = 60
+cancel_key = "esc"
+ignore_ctrl = $IGNORE_CTRL
+ignore_shift = $IGNORE_SHIFT
+ignore_super = $IGNORE_SUPER
+
+[audio]
+device = "default"
+debug_save = false
+debug_dir = "$STATE_DIR/audio"
+
+[stt]
+language = "en"
+keywords = []
+warmup = true
+
+[inject]
+method = "clipboard"
+paste_key = "ctrl+v"
+trailing_space = true
+restore_clipboard = false
+
+[feedback]
+mode = "beep"
+volume = 20000
+
+[logging]
+level = "INFO"
+log_transcripts = false
+EOF
+    ok "trigger is $KEYS"
+fi
+
+# Prove the chord actually fires. A chord that contains a guard modifier is
+# silently blocked unless that guard is off, so this catches the one mistake
+# that would otherwise leave the daemon deaf to the hotkey.
+say "Checking the trigger"
+
+if ! "$BIN_DIR/$SERVICE_NAME" --check-trigger; then
+    die "the trigger $KEYS is not working. Try another chord, for example --keys 'ctrl+shift+l'."
+fi
+ok "trigger works"
+
+# ------------------------------------------------------------------- service
+
+say "Setting up autostart"
+
+if ! command -v systemctl >/dev/null 2>&1; then
+    warn "systemd is not available; start the daemon by hand with '$SERVICE_NAME'."
+elif [ ! -d "$UNIT_DIR" ]; then
+    mkdir -p "$UNIT_DIR"
+fi
+
+if [ -d "$UNIT_DIR" ]; then
+    cat > "$UNIT_DIR/$SERVICE_NAME.service" <<EOF
+[Unit]
+Description=Whistleflow — local push-to-talk dictation
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=$BIN_DIR/$SERVICE_NAME
+Restart=on-failure
+RestartSec=3
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target
+EOF
+    ok "unit written"
+    systemctl --user daemon-reload >/dev/null 2>&1 || true
+    systemctl --user enable "$SERVICE_NAME.service" >/dev/null 2>&1 || true
+    ok "starts at login"
+fi
+
+if [ "$DO_START" -eq 1 ] && command -v systemctl >/dev/null 2>&1; then
+    systemctl --user restart "$SERVICE_NAME.service" >/dev/null 2>&1 || true
+    sleep 2
+fi
+# --------------------------------------------------------------------- check
+
+say "Checking the installation"
+
+"$BIN_DIR/$SERVICE_NAME" --check
+CHECK_STATUS=$?
+
+if [ "$CHECK_STATUS" -ne 0 ]; then
+    warn "something is missing — the report above says what."
+    exit 1
+fi
+
+if [ "$DO_START" -eq 1 ]; then
+    printf '\n\033[1;32mwhistleflow is installed and running.\033[0m\n\n'
+else
+    printf '\n\033[1;32mwhistleflow is installed but was not started.\033[0m\n\n'
+    printf '    Start it with: systemctl --user start %s\n\n' "$SERVICE_NAME"
+fi
+
+# The canonical raw URL of the uninstaller, for the removal hint.
+OWNER_NAME="$(basename "$(dirname "$REPO_URL")")"
+REPO_NAME="$(basename "$REPO_URL" .git)"
+RAW_URL="https://raw.githubusercontent.com/$OWNER_NAME/$REPO_NAME/main"
+
+printf '    Hold \033[1m%s\033[0m, speak, release.\n' "$KEYS"
+printf '    Check     %s --check\n' "$BIN_DIR/$SERVICE_NAME"
+printf '    Logs      journalctl --user -u %s -f\n' "$SERVICE_NAME"
+printf '    Stop      systemctl --user stop %s\n' "$SERVICE_NAME"
+printf '    Remove    curl -fsSL %s/uninstall.sh | sh\n\n' "$RAW_URL"
